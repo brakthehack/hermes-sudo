@@ -1,23 +1,16 @@
-"""hermes-sudo plugin — secure ephemeral sudo access via system PAM.
+"""hermes-sudo plugin — secure sudo for Hermes Agent.
 
-Provides:
-- ``sudo_authorize`` tool — authenticate via system password prompt
-- ``pre_tool_call`` hook — gate terminal sudo commands
-- ``post_tool_call`` hook — consume once-scoped authorization
-- ``on_session_end`` hook — clear timestamps on session teardown
+Your agent can run sudo commands. Your password never leaves your keyboard.
 """
 
 from __future__ import annotations
 
 import logging
-import sys
-import os
 
 try:
     from . import schemas as _schemas
     from . import tools as _tools
 except ImportError:
-    # Standalone import (e.g. pytest from project root)
     _schemas = None
     _tools = None
 
@@ -25,11 +18,6 @@ logger = logging.getLogger(__name__)
 
 
 def register(ctx) -> None:
-    """Register the sudo_authorize tool and lifecycle hooks.
-
-    Called once by the plugin loader when the plugin is enabled via
-    ``plugins.enabled`` in config.yaml.
-    """
     ctx.register_tool(
         name="sudo_authorize",
         toolset="hermes_sudo",

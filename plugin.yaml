@@ -1,6 +1,6 @@
 name: hermes-sudo
 version: 1.0.0
-description: "Secure ephemeral sudo access via system PAM authentication. Default: authorize one command only. Supports session-scoped authorization. Uses sudo -v to prompt on /dev/tty — passwords are never exposed to the agent."
+description: "Let your agent run sudo — without ever seeing your password. Authenticate once via your system password prompt. Default: one command only."
 author: "hermes-sudo"
 kind: standalone
 provides_tools:

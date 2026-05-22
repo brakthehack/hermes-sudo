@@ -1,88 +1,48 @@
 # hermes-sudo
 
-**Secure ephemeral sudo access for [hermes-agent](https://github.com/NousResearch/hermes-agent).**
+**Your agent runs `sudo` commands. Your password stays with you.**
 
-Authenticates using the **system's PAM stack** (`sudo -v` on `/dev/tty`) — the agent never sees or handles your password. Default: authorize one command at a time. Supports session-scoped authorization.
+hermes-sudo lets your Hermes agent run `sudo` commands without ever seeing your password. Authentication happens through your system's normal `sudo` prompt — the same one you see in a terminal. No stdin piping, no secret storage.
 
-## How it works
-
-Most agent sudo solutions pipe the password through stdin (`sudo -S`), exposing it to the agent process. This plugin takes a different approach:
-
-1. **`sudo_authorize`** calls `sudo -v` to authenticate the user via the system's PAM prompt on `/dev/tty` (the same prompt you'd see running `sudo` in a terminal). Your password goes directly from your keyboard to `sudo` — hermes never touches it.
-2. After successful authentication, `sudo` commands work using the system's **timestamp mechanism** (credential cache). The existing terminal tool already detects valid timestamps and skips `-S` password injection, so the plugin just needs to ensure a valid timestamp exists.
-
-## Installation
+## Quick start
 
 ```bash
 hermes plugins enable hermes-sudo
 ```
 
-Or add to `~/.hermes/cli-config.yaml`:
+That's it. Next time your agent needs `sudo`, it'll prompt you through the tool `sudo_authorize` first.
 
-```yaml
-plugins:
-  enabled:
-    - hermes-sudo
-```
+## How it works
 
-The plugin is a **user plugin** — it lives at `~/.hermes/plugins/hermes-sudo/`. To develop or inspect, clone this repo and symlink:
+| Step | What happens |
+|------|-------------|
+| 1. Agent needs `sudo` | The agent calls `sudo_authorize` |
+| 2. You authenticate | A standard password prompt appears on your terminal |
+| 3. Command runs | The agent executes one `sudo` command |
+| 4. Credentials wiped | `sudo -k` clears the timestamp — no piggybacking |
 
-```bash
-git clone <this-repo> ~/.hermes/plugins/hermes-sudo
-```
+## Two scopes
 
-## Usage
+- **`once`** (default) — authorize one command. The agent must re-authorize for each subsequent `sudo`.
+- **`session`** — authorize for the whole conversation. `sudo -k` runs when the session ends.
 
-### Authorize a single command (default)
+## Safety details
 
-```json
-{
-  "name": "sudo_authorize",
-  "arguments": { "scope": "once" }
-}
-```
-
-- A system password prompt appears on your terminal.
-- The agent may run **one** `sudo` command, then must re-authorize.
-- After the command runs, `sudo -k` clears the credential cache.
-
-### Authorize for the session
-
-```json
-{
-  "name": "sudo_authorize",
-  "arguments": { "scope": "session" }
-}
-```
-
-- The agent may run any number of `sudo` commands until the session ends.
-- If the sudo timestamp expires during the session, the plugin attempts silent re-authentication automatically. If that fails, the agent is blocked and must call `sudo_authorize` again.
-
-## Tool reference
-
-### `sudo_authorize`
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `scope` | `string` (`"once"` \| `"session"`) | `"once"` | Duration of authorization |
-
-Returns: `{"success": true, "scope": "once|session", "message": "…"}` or `{"error": "…"}`.
-
-## Security model
-
-- **Password not stored** — authentication goes through `sudo -v` on `/dev/tty`. The tool handler never reads, sends, or stores the password.
-- **One-command default** — scope=`"once"` prevents the agent from running a series of sudo commands after a single authorization. Each command requires explicit re-authorization.
-- **Timestamp cleared** — after "once" scope is consumed, `sudo -k` invalidates the credential cache so the agent cannot exploit a still-valid timestamp window.
-- **Session teardown** — `sudo -k` runs at session end regardless of scope.
-- **NOPASSWD bypass** — when the user has passwordless sudo configured, commands pass through without an `sudo_authorize` call (opt-in management via `HERMES_SUDO_ALLOW_NOPASSWD`, default: allow).
+| Concern | How it's handled |
+|---------|-----------------|
+| Password exposure | `sudo -v` prompts on `/dev/tty` — agent never reads your input |
+| Batch abuse | `once` scope + `sudo -k` after each command prevents cascading |
+| NOPASSWD users | Works transparently — no authorization prompt needed |
+| Session cleanup | `sudo -k` runs automatically when the session ends |
 
 ## Configuration
 
-| Environment variable | Default | Description |
-|---------------------|---------|-------------|
-| `HERMES_SUDO_ALLOW_NOPASSWD` | `true` | When `false`, require explicit `sudo_authorize` even if the user has NOPASSWD sudo configured. |
+| Env var | Default | Effect |
+|---------|---------|--------|
+| `HERMES_SUDO_ALLOW_NOPASSWD` | `true` | Set to `false` to require explicit authorization even if you have passwordless sudo |
 
-## Limitations
+## Requirements
 
-- **CLI mode only** — relies on `/dev/tty` for the PAM prompt. Gateway/API modes do not have a controlling terminal.
-- **`env sudo`** — commands like `env -i sudo whoami` (where sudo is an argument to another command) are not detected as sudo invocations. This is an acceptable edge case — agents do not normally proxy through `env`.
+- Hermes Agent (CLI mode only — `/dev/tty` required)
+- `sudo` with PAM authentication
+- Linux / macOS
