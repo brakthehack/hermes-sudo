@@ -18,13 +18,18 @@ That's it. The next time your agent needs `sudo`, it will call the `sudo_authori
 |----------|------------------|
 | **Agent never sees your password** | Authentication uses `sudo -v` on `/dev/tty`. Your password goes directly from your keyboard to the system PAM stack — the agent process never reads, stores, or forwards it. |
 | **Can't batch sudo commands** | Default scope is `once`: one `sudo` command per authorization. After it runs, `sudo -k` immediately invalidates the credential cache. |
+| **Destructive commands blocked** | Scope `confirm` catches dangerous tools (`rm`, `dd`, `mkfs`, etc.) and asks you before they run. |
 | **Session ends cleanly** | When the conversation ends, `sudo -k` runs automatically — no lingering credentials. |
+| **Audit trail** | Every `sudo` invocation is logged to `~/.hermes/logs/sudo-audit.log` with timestamp and command. |
 | **No stdin piping** | Uses `sudo -v` (validate), not `sudo -S` (stdin). Your password is never in the command pipeline. |
 
-## Two scopes
+## Scopes
 
-- **`once`** (default) — one `sudo` command, then re-authorize.
-- **`session`** — authorize for the whole conversation.
+| Scope | Commands per auth | Destructive ops |
+|-------|-----------------|-----------------|
+| `once` | 1 | Allowed (re-authorize for more) |
+| `confirm` | 1 | **Blocked** — you must explicitly authorize `rm`, `dd`, `mkfs`, and similar |
+| `session` | Unlimited until session ends | Allowed |
 
 ## Configuration
 
