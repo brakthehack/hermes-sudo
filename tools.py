@@ -22,6 +22,13 @@ _lock = threading.Lock()
 _sudo_scope: Optional[str] = None   # None | "once" | "session"
 _sudo_consumed: bool = False
 
+_PREFIX_TOKENS = frozenset({
+    # Note: "command" intentionally excluded. "command -v" is informational,
+    # not execution. Agents use bare "sudo", not "command sudo".
+    "exec", "nohup", "nice", "env", "ionice", "stdbuf",
+    "chrt", "schedtool", "setsid", "taskset", "time",
+})
+
 
 def _reset_state() -> None:
     """Reset all module state. Caller must hold _lock or call from session end."""
@@ -42,10 +49,36 @@ def _command_has_real_sudo(command: str) -> bool:
 
     Does NOT flag: ``echo "sudo"``, ``rg 'sudo' file``, ``PATH=/usr/bin/sudo``,
     ``man sudo``.
+
+    Also handles subshells (``(sudo cmd)``), command substitution
+    (``$(sudo cmd)``), prefix commands (``nohup sudo cmd``),
+    and heredoc bodies (``cat <<EOF\nsudo\nEOF``).
     """
     i = 0
     n = len(command)
     cmd_start = True
+    env_pending = False  # True after KEY=val at command-start (quoted value is not a command)
+    prefix_active = False  # True after a prefix command (nohup, time, etc.) before the real command
+
+    def _skip_heredoc(delim: str, allow_tabs: bool) -> None:
+        """Skip heredoc body starting at position *i*. Updates *i* in-place."""
+        nonlocal i
+        while i < n:
+            nl = command.find("\n", i)
+            if nl == -1:
+                i = n
+                return
+            line_start = nl + 1
+            scan = line_start
+            if allow_tabs:
+                while scan < n and command[scan] == "\t":
+                    scan += 1
+            if command[scan:scan + len(delim)] == delim:
+                rest = scan + len(delim)
+                if rest >= n or command[rest] == "\n":
+                    i = rest + 1 if rest < n and command[rest] == "\n" else n
+                    return
+            i = nl + 1
 
     while i < n:
         c = command[i]
@@ -54,6 +87,8 @@ def _command_has_real_sudo(command: str) -> bool:
         if c == "\n":
             i += 1
             cmd_start = True
+            env_pending = False
+            prefix_active = False
             continue
 
         # Whitespace is neutral.
@@ -61,60 +96,119 @@ def _command_has_real_sudo(command: str) -> bool:
             i += 1
             continue
 
-        # Comment at command-start: skip to end of line.
-        if c == "#":
+        # Comment only at command-start, skip to end of line.
+        if c == "#" and cmd_start:
             nl = command.find("\n", i)
             if nl == -1:
                 return False
             i = nl + 1
             cmd_start = True
+            env_pending = False
+            prefix_active = False
             continue
+
         # Two-character chain operators (check before single-char).
         if i + 1 < n:
             two = command[i : i + 2]
             if two in ("&&", "||"):
                 i += 2
                 cmd_start = True
+                env_pending = False
+                prefix_active = False
                 continue
 
         # Single-character command separators / terminators.
         if c in ";|":
             i += 1
             cmd_start = True
+            env_pending = False
+            prefix_active = False
             continue
 
         # Background operator (``&`` — not ``&&`` which was caught above).
-        if c == "&":
+        if c == "&" and not (i > 0 and command[i - 1] == ">"):
             i += 1
             cmd_start = True
+            env_pending = False
+            prefix_active = False
             continue
 
-        # Parenthesised subshell — skip to matching close.
+        # Parenthesised subshell — recurse into content to find sudo.
         if c == "(":
+            # Check for $(( arithmetic )) — skip entirely.
+            prev_is_dollar = i > 0 and command[i - 1] == "$"
+            if prev_is_dollar and i + 1 < n and command[i + 1] == "(":
+                # $(( ... )) — skip to closing )).
+                i += 2
+                depth = 1
+                while i < n and depth > 0:
+                    if i + 1 < n and command[i] == ")" and command[i + 1] == ")":
+                        depth -= 1
+                        i += 2
+                    elif command[i] == "(":
+                        depth += 1
+                        i += 1
+                    elif command[i] == ")":
+                        depth -= 1
+                        i += 1
+                    else:
+                        i += 1
+                cmd_start = False
+                env_pending = False
+                prefix_active = False
+                continue
+
+            # $(command substitution) or (subshell) — recurse.
             depth = 1
+            start = i + 1
             i += 1
             while i < n and depth > 0:
                 if command[i] == "(":
                     depth += 1
                 elif command[i] == ")":
                     depth -= 1
-                i += 1
+                if depth > 0:
+                    i += 1
+            content = command[start:i]
+            i += 1  # past closing )
+            if _command_has_real_sudo(content):
+                return True
             cmd_start = False
+            env_pending = False
+            prefix_active = False
             continue
 
-        # Quoted strings — skip entire quoted content.
+        # Quoted strings — check for quoted sudo at command-start.
         if c in "'\"":
             quote = c
             i += 1
+            content_parts: list[str] = []
             while i < n:
                 if command[i] == "\\" and i + 1 < n:
-                    i += 2
+                    # In double quotes, \ escapes only $, `, ", \, newline.
+                    # In single quotes, backslash is literal.
+                    if quote == '"' and command[i + 1] in "$`\"\\\n":
+                        content_parts.append(command[i + 1])
+                        i += 2
+                    elif quote == "'":
+                        content_parts.append("\\")
+                        i += 1
+                    else:
+                        content_parts.append(command[i])
+                        i += 1
                 elif command[i] == quote:
+                    content = "".join(content_parts)
+                    # Quoted "sudo" at command-start is a real sudo (but not after KEY=val).
+                    if cmd_start and not env_pending and content == "sudo":
+                        return True
                     i += 1
                     break
                 else:
+                    content_parts.append(command[i])
                     i += 1
             cmd_start = False
+            env_pending = False
+            prefix_active = False
             continue
 
         # Read an unquoted token.
@@ -124,20 +218,85 @@ def _command_has_real_sudo(command: str) -> bool:
             if c2.isspace() or c2 in ";&|\"'#\n()":
                 break
             if c2 == "\\" and i + 1 < n:
+                if command[i + 1] == "\n":
+                    break  # backslash-newline is line continuation — token ends here
                 i += 2
             else:
                 i += 1
         token = command[start:i]
 
+        # Avoid infinite loop when a break-set char (like # at non-cmd-start)
+        # falls through to the token reader and produces an empty token.
+        if start == i:
+            i += 1
+            continue
+
         if cmd_start and token == "sudo":
             return True
 
-        # ``KEY=val`` at command-start is an env assignment — still at
-        # command-start after it (e.g. ``DEBUG=1 sudo cmd``).
+        # Heredoc: skip body to avoid false positives.
+        heredoc_idx = token.find("<<")
+        if heredoc_idx >= 0 and not (heredoc_idx + 2 < len(token) and token[heredoc_idx + 2] == '<'):
+            delim_part = token[heredoc_idx + 2:]
+            tab_prefix = False
+            if delim_part.startswith("-"):
+                tab_prefix = True
+                delim_part = delim_part[1:]
+            if delim_part and delim_part[0] in "'\"":
+                delim_part = delim_part[1:-1]
+            elif delim_part.startswith("\\"):
+                delim_part = delim_part[1:]
+
+            if delim_part:
+                _skip_heredoc(delim_part, tab_prefix)
+                cmd_start = True
+                env_pending = False
+                prefix_active = False
+                continue
+            else:
+                # << followed by space — read the delimiter as the next word.
+                while i < n and command[i].isspace():
+                    i += 1
+                if i < n and command[i] in "'\"":
+                    quote = command[i]
+                    i += 1
+                    dstart = i
+                    while i < n and command[i] != quote:
+                        i += 1
+                    delim_part = command[dstart:i]
+                    i += 1  # skip closing quote
+                else:
+                    dstart = i
+                    while i < n and not command[i].isspace() and command[i] not in ";|()\n&":
+                        i += 1
+                    delim_part = command[dstart:i]
+                if delim_part:
+                    _skip_heredoc(delim_part, tab_prefix)
+                cmd_start = True
+                env_pending = False
+                prefix_active = False
+                continue
+
+        # KEY=val at command-start is an env assignment — still at
+        # command-start after it (e.g. DEBUG=1 sudo cmd).
         if cmd_start and "=" in token and not token.startswith("-"):
-            pass  # keep cmd_start = True
+            env_pending = True
+            prefix_active = False
+            # cmd_start stays True
+        # Prefix commands that execute their arguments — still at
+        # command-start after them (e.g. nohup sudo cmd).
+        elif cmd_start and token in _PREFIX_TOKENS:
+            env_pending = False
+            prefix_active = True
+            # cmd_start stays True
+        # Options and numeric args after a prefix — keep cmd_start active.
+        elif cmd_start and prefix_active and (token.startswith("-") or token.isdigit()):
+            # cmd_start and prefix_active both stay True
+            pass
         else:
             cmd_start = False
+            env_pending = False
+            prefix_active = False
 
     return False
 
@@ -199,7 +358,7 @@ def _run_sudo_v() -> int:
             ["sudo", "-v"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=None,
             timeout=60,
             check=False,
         )

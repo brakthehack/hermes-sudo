@@ -10,9 +10,16 @@ Provides:
 from __future__ import annotations
 
 import logging
+import sys
+import os
 
-from . import schemas as _schemas
-from . import tools as _tools
+try:
+    from . import schemas as _schemas
+    from . import tools as _tools
+except ImportError:
+    # Standalone import (e.g. pytest from project root)
+    _schemas = None
+    _tools = None
 
 logger = logging.getLogger(__name__)
 
