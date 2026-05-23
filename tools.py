@@ -666,15 +666,20 @@ def _on_pre_tool_call(
     if not _command_has_real_sudo(command):
         return None
 
-    allow_nopasswd = os.environ.get("HERMES_SUDO_ALLOW_NOPASSWD", "true").strip().lower()
-    if allow_nopasswd in ("1", "true", "yes", "on") and _sudo_nopasswd_works():
-        logger.debug("hermes-sudo: NOPASSWD sudo detected — passing through")
-        _log_audit("EXEC", command, user="agent-nopasswd")
-        return None
-
     with _lock:
         scope = _sudo_scope
         consumed = _sudo_consumed
+
+    # NOPASSWD fast path: only bypass scope checks when no explicit scope is set.
+    # When a scope IS set, the user wants scope enforcement regardless of whether
+    # sudo credentials happen to be cached — otherwise confirm/once/session
+    # scopes are silently disabled for any user with valid sudo credentials.
+    if scope is None:
+        allow_nopasswd = os.environ.get("HERMES_SUDO_ALLOW_NOPASSWD", "true").strip().lower()
+        if allow_nopasswd in ("1", "true", "yes", "on") and _sudo_nopasswd_works():
+            logger.debug("hermes-sudo: NOPASSWD sudo detected — passing through")
+            _log_audit("EXEC", command, user="agent-nopasswd")
+            return None
 
     if scope is None:
         return {
