@@ -492,13 +492,11 @@ def _run_sudo_v() -> int:
 
     Strategy (tried in order):
 
-    1. **Direct /dev/tty read + sudo -S** — Opens ``/dev/tty`` directly
-       and writes the prompt + reads the password using raw termios ops.
-       Does NOT use ``getpass.getpass()`` (which writes to ``sys.stdout``,
-       captured by Hermes's tool output) and does NOT give ``sudo`` the
-       TTY directly (Hermes writes to it concurrently, garbling the prompt).
-       The password is piped via stdin to ``sudo -S -v`` and zeroed in
-       memory immediately after use.
+    1. **Hermes sudo callback** — calls ``_prompt_for_sudo_password()``
+       from ``tools.terminal_tool``, which delegates to the CLI's registered
+       ``_sudo_password_callback`` (prompt_toolkit UI) when available, or
+       falls back to a threaded ``/dev/tty`` read with spinner pause.
+       Password is piped to ``sudo -S -v`` and zeroed immediately.
 
     2. **/dev/tty + sudo -v** — direct ``/dev/tty`` open passed to sudo.
        Works in normal terminals outside Hermes.
@@ -507,38 +505,12 @@ def _run_sudo_v() -> int:
 
     4. **No-TTY fallback** — ``sudo -v`` with DEVNULL stdin.
     """
-    # Strategy 1: direct /dev/tty read + sudo -S (works inside Hermes main loop)
+    # Strategy 1: Hermes sudo callback (prompt_toolkit integration)
     try:
-        import termios as _termios
-        tty_fd = os.open("/dev/tty", os.O_RDWR)
-        # Write prompt directly to /dev/tty (bypasses Hermes's stdout capture)
-        prompt = "[sudo] password for %s: " % os.getlogin()
-        os.write(tty_fd, prompt.encode())
-        # Disable echo
-        old_attrs = _termios.tcgetattr(tty_fd)
-        new_attrs = _termios.tcgetattr(tty_fd)
-        new_attrs[3] = new_attrs[3] & ~_termios.ECHO
-        _termios.tcsetattr(tty_fd, _termios.TCSAFLUSH, new_attrs)
-        # Read password character by character until newline
-        password_chars: list[bytes] = []
-        while True:
-            b = os.read(tty_fd, 1)
-            if not b or b in (b"\n", b"\r"):
-                break
-            if b == b"\x03":  # Ctrl-C
-                raise KeyboardInterrupt
-            if b == b"\x7f" or b == b"\x08":  # Backspace
-                if password_chars:
-                    password_chars.pop()
-                continue
-            password_chars.append(b)
-        # Restore terminal settings
-        _termios.tcsetattr(tty_fd, _termios.TCSAFLUSH, old_attrs)
-        # Write newline after password entry
-        os.write(tty_fd, b"\n")
-        os.close(tty_fd)
-
-        password = b"".join(password_chars).decode("utf-8", errors="replace")
+        from tools.terminal_tool import _prompt_for_sudo_password
+        password = _prompt_for_sudo_password(timeout_seconds=45)
+        if not password:
+            return 1
         proc = subprocess.run(
             ["sudo", "-S", "-v"],
             input=password + "\n",
@@ -551,18 +523,8 @@ def _run_sudo_v() -> int:
         # Zero the password from memory immediately
         password = "\x00" * len(password)
         return proc.returncode
-    except (OSError, EOFError, KeyboardInterrupt, subprocess.TimeoutExpired):
+    except Exception:
         pass
-    except Exception as _ex:
-        # termios.error or similar — attempt cleanup
-        try:
-            _termios.tcsetattr(tty_fd, _termios.TCSAFLUSH, old_attrs)  # type: ignore
-        except Exception:
-            pass
-        try:
-            os.close(tty_fd)  # type: ignore
-        except Exception:
-            pass
 
     # Strategy 2: direct /dev/tty
     try:
