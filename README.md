@@ -37,6 +37,16 @@ That's it. The next time your agent needs `sudo`, it will call the `sudo_authori
 |---------|---------|--------|
 | `HERMES_SUDO_ALLOW_NOPASSWD` | `true` | Set to `false` to require explicit authorization even if you already have passwordless sudo |
 
+## Installing from source
+
+```bash
+git clone https://github.com/your-org/hermes-sudo.git
+cd hermes-sudo
+bash install.sh         # install or update the plugin
+```
+
+After installing, start a fresh session (`/reset`).
+
 ## Requirements
 
 - Hermes Agent (CLI mode — needs `/dev/tty`)

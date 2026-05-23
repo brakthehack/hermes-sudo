@@ -411,7 +411,201 @@ def _sudo_timestamp_valid() -> bool:
         return False
 
 
+def _find_tty_path() -> Optional[str]:
+    """Walk the process tree upward to find a TTY.
+
+    In Hermes Agent, the main CLI process owns the terminal while tool
+    handlers run in child processes with no controlling TTY.  We scan
+    from the current process up the parent chain or, failing that, scan
+    all visible processes for one that has both a TTY and 'hermes' in
+    its cmdline (the Hermes CLI).  Returns an absolute path like
+    '/dev/pts/0' or None.
+    """
+    import stat as _st
+
+    def _tty_nr_to_path(tty_nr: int) -> Optional[str]:
+        if tty_nr == 0:
+            return None
+        major = (tty_nr >> 8) & 0xFFF
+        minor = (tty_nr & 0xFF) | ((tty_nr >> 12) & 0xFFF00)
+        for pty_root in ("/dev/pts", "/dev"):
+            try:
+                for entry in os.listdir(pty_root):
+                    full = os.path.join(pty_root, entry)
+                    try:
+                        st = os.stat(full)
+                        if not _st.S_ISCHR(st.st_mode):
+                            continue
+                        if os.major(st.st_rdev) == major and os.minor(st.st_rdev) == minor:
+                            return full
+                    except OSError:
+                        continue
+            except PermissionError:
+                continue
+        return f"/dev/pts/{minor}"  # best guess
+
+    # Try walking up the parent chain first
+    pid = os.getpid()
+    seen: set[int] = set()
+    while pid > 1 and pid not in seen:
+        seen.add(pid)
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                parts = f.read().split(")")
+                tail = parts[1].strip().split()
+                ppid = int(tail[2])
+                tty_nr = int(tail[4])
+            tty_path = _tty_nr_to_path(tty_nr)
+            if tty_path is not None:
+                return tty_path
+            pid = ppid
+        except (FileNotFoundError, IndexError, ValueError, PermissionError):
+            break
+
+    # Fallback: scan all processes for a Hermes-owned TTY
+    for proc in os.listdir("/proc"):
+        if not proc.isdigit():
+            continue
+        try:
+            with open(f"/proc/{proc}/cmdline") as f:
+                cmdline = f.read().replace("\x00", " ")
+            if not cmdline or "hermes" not in cmdline:
+                continue
+        except (FileNotFoundError, PermissionError):
+            continue
+        try:
+            with open(f"/proc/{proc}/stat") as f:
+                parts = f.read().split(")")
+                tail = parts[1].strip().split()
+                tty_nr = int(tail[4])
+            tty_path = _tty_nr_to_path(tty_nr)
+            if tty_path is not None:
+                return tty_path
+        except (FileNotFoundError, IndexError, ValueError, PermissionError):
+            continue
+
+    return None
+
+
 def _run_sudo_v() -> int:
+    """Authenticate via ``sudo -v``.
+
+    Strategy (tried in order):
+
+    1. **Direct /dev/tty read + sudo -S** — Opens ``/dev/tty`` directly
+       and writes the prompt + reads the password using raw termios ops.
+       Does NOT use ``getpass.getpass()`` (which writes to ``sys.stdout``,
+       captured by Hermes's tool output) and does NOT give ``sudo`` the
+       TTY directly (Hermes writes to it concurrently, garbling the prompt).
+       The password is piped via stdin to ``sudo -S -v`` and zeroed in
+       memory immediately after use.
+
+    2. **/dev/tty + sudo -v** — direct ``/dev/tty`` open passed to sudo.
+       Works in normal terminals outside Hermes.
+
+    3. **PTY scan + sudo -v** — find the Hermes CLI's PTY via ``/proc``.
+
+    4. **No-TTY fallback** — ``sudo -v`` with DEVNULL stdin.
+    """
+    # Strategy 1: direct /dev/tty read + sudo -S (works inside Hermes main loop)
+    try:
+        import termios as _termios
+        tty_fd = os.open("/dev/tty", os.O_RDWR)
+        # Write prompt directly to /dev/tty (bypasses Hermes's stdout capture)
+        prompt = "[sudo] password for %s: " % os.getlogin()
+        os.write(tty_fd, prompt.encode())
+        # Disable echo
+        old_attrs = _termios.tcgetattr(tty_fd)
+        new_attrs = _termios.tcgetattr(tty_fd)
+        new_attrs[3] = new_attrs[3] & ~_termios.ECHO
+        _termios.tcsetattr(tty_fd, _termios.TCSAFLUSH, new_attrs)
+        # Read password character by character until newline
+        password_chars: list[bytes] = []
+        while True:
+            b = os.read(tty_fd, 1)
+            if not b or b in (b"\n", b"\r"):
+                break
+            if b == b"\x03":  # Ctrl-C
+                raise KeyboardInterrupt
+            if b == b"\x7f" or b == b"\x08":  # Backspace
+                if password_chars:
+                    password_chars.pop()
+                continue
+            password_chars.append(b)
+        # Restore terminal settings
+        _termios.tcsetattr(tty_fd, _termios.TCSAFLUSH, old_attrs)
+        # Write newline after password entry
+        os.write(tty_fd, b"\n")
+        os.close(tty_fd)
+
+        password = b"".join(password_chars).decode("utf-8", errors="replace")
+        proc = subprocess.run(
+            ["sudo", "-S", "-v"],
+            input=password + "\n",
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+            check=False,
+        )
+        # Zero the password from memory immediately
+        password = "\x00" * len(password)
+        return proc.returncode
+    except (OSError, EOFError, KeyboardInterrupt, subprocess.TimeoutExpired):
+        pass
+    except Exception as _ex:
+        # termios.error or similar — attempt cleanup
+        try:
+            _termios.tcsetattr(tty_fd, _termios.TCSAFLUSH, old_attrs)  # type: ignore
+        except Exception:
+            pass
+        try:
+            os.close(tty_fd)  # type: ignore
+        except Exception:
+            pass
+
+    # Strategy 2: direct /dev/tty
+    try:
+        tty_fd = os.open("/dev/tty", os.O_RDWR)
+        proc = subprocess.run(
+            ["sudo", "-v"],
+            stdin=tty_fd,
+            stdout=tty_fd,
+            stderr=tty_fd,
+            timeout=60,
+            close_fds=False,
+            check=False,
+        )
+        os.close(tty_fd)
+        return proc.returncode
+    except OSError:
+        pass
+
+    # Strategy 3: find Hermes CLI PTY via /proc scan
+    tty_path = _find_tty_path()
+    if tty_path is not None:
+        tty_fd = None
+        try:
+            tty_fd = os.open(tty_path, os.O_RDWR)
+            proc = subprocess.run(
+                ["sudo", "-v"],
+                stdin=tty_fd,
+                stdout=tty_fd,
+                stderr=tty_fd,
+                timeout=60,
+                close_fds=False,
+                check=False,
+            )
+            os.close(tty_fd)
+            return proc.returncode
+        except OSError:
+            if tty_fd is not None:
+                try:
+                    os.close(tty_fd)
+                except OSError:
+                    pass
+
+    # Strategy 4: no-TTY fallback
     try:
         proc = subprocess.run(
             ["sudo", "-v"],
@@ -421,8 +615,6 @@ def _run_sudo_v() -> int:
             timeout=60, check=False,
         )
         return proc.returncode
-    except subprocess.TimeoutExpired:
-        return 1
     except Exception:
         return 1
 
