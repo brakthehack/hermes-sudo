@@ -58,38 +58,168 @@ def _command_needs_confirm(command: str) -> bool:
 
     Matches both bare tool names (``mkfs``) and variants (``mkfs.ext4``).
     """
+    return _scan_for_confirm(command, len(command))
+
+
+def _is_confirm_trigger(token: str) -> bool:
+    """Check if a token matches a confirm trigger."""
+    for trigger in _CONFIRM_TRIGGERS:
+        if token == trigger or token.startswith(trigger + "."):
+            return True
+    return False
+
+
+def _scan_for_confirm(command: str, n: int) -> bool:
+    """Scan a command string for destructive triggers.
+
+    Handles prefix commands, env assignments, subshells, command substitutions,
+    backslash-newline continuations, and chain operators.
+    """
     i = 0
-    n = len(command)
-    at_cmd_start = True
-    after_sudo = False
+    cmd_start = True
+    env_pending = False
+    prefix_active = False
+
     while i < n:
         c = command[i]
-        if c.isspace() or c == "\n":
+
+        # Newline resets command context
+        if c == "\n":
+            i += 1
+            cmd_start = True
+            env_pending = False
+            prefix_active = False
+            continue
+
+        if c.isspace():
             i += 1
             continue
+
         # Skip comments (only at command start)
-        if c == "#" and at_cmd_start:
+        if c == "#" and cmd_start:
             nl = command.find("\n", i)
             i = nl + 1 if nl != -1 else n
-            at_cmd_start = True
+            cmd_start = True
+            env_pending = False
+            prefix_active = False
             continue
-        # Command separators and operators reset to command-start
-        if c in ";|&)":
+
+        # Backslash-newline continuation: skip the backslash and newline
+        if c == "\\" and i + 1 < n and command[i + 1] == "\n":
+            i += 2
+            continue
+
+        # Chain operators
+        if i + 1 < n:
+            two = command[i : i + 2]
+            if two in ("&&", "||"):
+                i += 2
+                cmd_start = True
+                env_pending = False
+                prefix_active = False
+                continue
+
+        # Command separators
+        if c in ";|":
             i += 1
-            at_cmd_start = True
+            cmd_start = True
+            env_pending = False
+            prefix_active = False
             continue
-        # Skip parenthesised groups
-        if c == "(":
+
+        # Background operator (but not 2>&1)
+        if c == "&" and not (i > 0 and command[i - 1] == ">"):
+            i += 1
+            cmd_start = True
+            env_pending = False
+            prefix_active = False
+            continue
+
+        # Arithmetic expansion $(( )) — skip
+        if c == "$" and i + 1 < n and command[i + 1] == "(":
+            if i + 2 < n and command[i + 2] == "(":
+                i += 2
+                depth = 1
+                while i < n and depth > 0:
+                    if i + 1 < n and command[i] == ")" and command[i + 1] == ")":
+                        depth -= 1
+                        i += 2
+                    elif command[i] == "(":
+                        depth += 1
+                        i += 1
+                    elif command[i] == ")":
+                        depth -= 1
+                        i += 1
+                    else:
+                        i += 1
+                cmd_start = False
+                env_pending = False
+                prefix_active = False
+                continue
+            # Command substitution $(...)
+            i += 1
             depth = 1
+            start = i
+            while i < n and depth > 0:
+                if command[i] == "(":
+                    depth += 1
+                elif command[i] == ")":
+                    depth -= 1
+                if depth > 0:
+                    i += 1
+            content = command[start:i]
+            i += 1
+            if _scan_for_confirm(content, len(content)):
+                return True
+            cmd_start = False
+            env_pending = False
+            prefix_active = False
+            continue
+
+        # Backtick command substitution
+        if c == "`":
+            i += 1
+            start = i
+            while i < n and command[i] != "`":
+                i += 1
+            content = command[start:i]
+            if i < n:
+                i += 1  # skip closing backtick
+            if _scan_for_confirm(content, len(content)):
+                return True
+            cmd_start = False
+            env_pending = False
+            prefix_active = False
+            continue
+
+        # Subshell ( ... )
+        if c == "(":
+            prev_is_dollar = i > 0 and command[i - 1] == "$"
+            if prev_is_dollar:
+                # $( was handled above; this shouldn't be reached but guard anyway
+                i += 1
+                cmd_start = False
+                continue
+            depth = 1
+            start = i + 1
             i += 1
             while i < n and depth > 0:
                 if command[i] == "(":
                     depth += 1
                 elif command[i] == ")":
                     depth -= 1
-                i += 1
-            at_cmd_start = False
+                if depth > 0:
+                    i += 1
+            content = command[start:i]
+            if i < n:
+                i += 1  # skip closing )
+            if _scan_for_confirm(content, len(content)):
+                return True
+            cmd_start = False
+            env_pending = False
+            prefix_active = False
             continue
+
         # Skip quoted strings
         if c in "'\"":
             quote = c
@@ -99,29 +229,83 @@ def _command_needs_confirm(command: str) -> bool:
                     i += 2
                 else:
                     i += 1
-            i += 1 if i < n else 0
-            at_cmd_start = False
+            if i < n:
+                i += 1  # skip closing quote
+            cmd_start = False
+            env_pending = False
+            prefix_active = False
             continue
+
         # Unquoted token
         start = i
-        while i < n and not command[i].isspace() and command[i] not in ";|&()\"'#":
+        while i < n:
+            c2 = command[i]
+            if c2.isspace() or c2 in ";|&()\"'#\n":
+                break
+            if c2 == "\\" and i + 1 < n and command[i + 1] == "\n":
+                break
             i += 1
         token = command[start:i]
-        if at_cmd_start:
-            if token == "sudo":
-                after_sudo = True
-                at_cmd_start = False
+
+        if not token:
+            i += 1
+            continue
+
+        # Strip leading backslashes for escaped commands
+        stripped_token = token.lstrip("\\")
+
+        if cmd_start:
+            if stripped_token == "sudo":
+                # After sudo, the next token is the real command
+                cmd_start = True
+                env_pending = False
+                prefix_active = False
                 continue
-            # Check if token starts with a confirm trigger (catches mkfs.ext4, etc.)
-            for trigger in _CONFIRM_TRIGGERS:
-                if token == trigger or token.startswith(trigger + "."):
-                    return True
-        elif after_sudo:
-            after_sudo = False
-            for trigger in _CONFIRM_TRIGGERS:
-                if token == trigger or token.startswith(trigger + "."):
-                    return True
-        at_cmd_start = False
+            # Check env assignment: VAR=value (no spaces, no leading dash)
+            if "=" in stripped_token and not stripped_token.startswith("-"):
+                env_pending = True
+                prefix_active = False
+                continue
+            # Check prefix command
+            if stripped_token in _PREFIX_TOKENS:
+                env_pending = False
+                prefix_active = True
+                continue
+            # Check if it's a trigger
+            if _is_confirm_trigger(stripped_token):
+                return True
+            cmd_start = False
+            env_pending = False
+            prefix_active = False
+        elif env_pending:
+            # This token follows an env assignment; it could be sudo, prefix, or the real command
+            env_pending = False
+            if stripped_token == "sudo":
+                cmd_start = True
+                prefix_active = False
+                continue
+            if stripped_token in _PREFIX_TOKENS:
+                prefix_active = True
+                continue
+            if _is_confirm_trigger(stripped_token):
+                return True
+            cmd_start = False
+            prefix_active = False
+        elif prefix_active:
+            # After prefix command, flags or the real command
+            if stripped_token.startswith("-") or stripped_token.isdigit():
+                continue
+            prefix_active = False
+            if stripped_token == "sudo":
+                cmd_start = True
+                continue
+            if _is_confirm_trigger(stripped_token):
+                return True
+            cmd_start = False
+        else:
+            # Not at command start, not after sudo/env/prefix — just an argument
+            pass
+
     return False
 
 
@@ -134,9 +318,7 @@ _sudo_scope: Optional[str] = None   # None | "once" | "session" | "confirm"
 _sudo_consumed: bool = False
 
 _PREFIX_TOKENS = frozenset({
-    # Note: "command" intentionally excluded. "command -v" is informational,
-    # not execution. Agents use bare "sudo", not "command sudo".
-    "exec", "nohup", "nice", "env", "ionice", "stdbuf",
+    "command", "exec", "nohup", "nice", "env", "ionice", "stdbuf",
     "chrt", "schedtool", "setsid", "taskset", "time",
 })
 
@@ -159,6 +341,7 @@ def _command_has_real_sudo(command: str) -> bool:
     cmd_start = True
     env_pending = False
     prefix_active = False
+    command_prefix_name = ""  # track which prefix command is active
 
     def _skip_heredoc(delim: str, allow_tabs: bool) -> None:
         nonlocal i
@@ -313,11 +496,11 @@ def _command_has_real_sudo(command: str) -> bool:
             i += 1
             continue
 
-        if cmd_start and token == "sudo":
+        if cmd_start and token.lstrip("\\") == "sudo":
             return True
 
         heredoc_idx = token.find("<<")
-        if heredoc_idx >= 0 and not (heredoc_idx + 2 < len(token) and token[heredoc_idx + 2] == '<'):
+        if heredoc_idx == 0 and not token.startswith("<<<"):
             delim_part = token[heredoc_idx + 2:]
             tab_prefix = False
             if delim_part.startswith("-"):
@@ -360,15 +543,26 @@ def _command_has_real_sudo(command: str) -> bool:
         if cmd_start and "=" in token and not token.startswith("-"):
             env_pending = True
             prefix_active = False
+            command_prefix_name = ""
         elif cmd_start and token in _PREFIX_TOKENS:
             env_pending = False
             prefix_active = True
-        elif cmd_start and prefix_active and (token.startswith("-") or token.isdigit()):
+            command_prefix_name = token
+        elif cmd_start and prefix_active and token.startswith("-"):
+            # "command -v" / "command -V" are informational lookups, not execution
+            if command_prefix_name == "command" and token in ("-v", "-V"):
+                cmd_start = False
+                env_pending = False
+                prefix_active = False
+                command_prefix_name = ""
+            continue
+        elif cmd_start and prefix_active and token.isdigit():
             pass
         else:
             cmd_start = False
             env_pending = False
             prefix_active = False
+            command_prefix_name = ""
 
     return False
 
@@ -453,7 +647,7 @@ def _find_tty_path() -> Optional[str]:
             with open(f"/proc/{pid}/stat") as f:
                 parts = f.read().split(")")
                 tail = parts[1].strip().split()
-                ppid = int(tail[2])
+                ppid = int(tail[1])
                 tty_nr = int(tail[4])
             tty_path = _tty_nr_to_path(tty_nr)
             if tty_path is not None:
@@ -487,101 +681,51 @@ def _find_tty_path() -> Optional[str]:
     return None
 
 
-def _run_sudo_v() -> int:
-    """Authenticate via ``sudo -v``.
+def _run_sudo_cache() -> bool:
+    """Prompt for sudo password and store it in the terminal tool's password cache.
 
-    Strategy (tried in order):
+    The terminal tool already handles piping the password via ``sudo -S`` on every
+    ``sudo`` command — it looks up ``_get_cached_sudo_password()``.  We just need
+    to populate that cache.
 
-    1. **Hermes sudo callback** — calls ``_prompt_for_sudo_password()``
-       from ``tools.terminal_tool``, which delegates to the CLI's registered
-       ``_sudo_password_callback`` (prompt_toolkit UI) when available, or
-       falls back to a threaded ``/dev/tty`` read with spinner pause.
-       Password is piped to ``sudo -S -v`` and zeroed immediately.
-
-    2. **/dev/tty + sudo -v** — direct ``/dev/tty`` open passed to sudo.
-       Works in normal terminals outside Hermes.
-
-    3. **PTY scan + sudo -v** — find the Hermes CLI's PTY via ``/proc``.
-
-    4. **No-TTY fallback** — ``sudo -v`` with DEVNULL stdin.
+    This avoids all TTY / ``requiretty`` issues: the password is piped on stdin
+    by the terminal tool's environment runner, which works without any TTY.
     """
-    # Strategy 1: Hermes sudo callback (prompt_toolkit integration)
     try:
-        from tools.terminal_tool import _prompt_for_sudo_password
-        password = _prompt_for_sudo_password(timeout_seconds=45)
-        if not password:
-            return 1
-        proc = subprocess.run(
+        from tools.terminal_tool import (
+            _prompt_for_sudo_password,
+            _set_cached_sudo_password,
+        )
+    except ImportError:
+        return False
+
+    password = _prompt_for_sudo_password(timeout_seconds=45)
+    if not password:
+        return False
+
+    _set_cached_sudo_password(password)
+    # Kick sudo -v in the background so the kernel timestamp is also valid.
+    # This is best-effort — the password-pipe path in the terminal tool works
+    # even if sudo -v fails.
+    try:
+        subprocess.run(
             ["sudo", "-S", "-v"],
             input=password + "\n",
             text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=60,
-            check=False,
-        )
-        # Zero the password from memory immediately
-        password = "\x00" * len(password)
-        return proc.returncode
-    except Exception:
-        pass
-
-    # Strategy 2: direct /dev/tty
-    try:
-        tty_fd = os.open("/dev/tty", os.O_RDWR)
-        proc = subprocess.run(
-            ["sudo", "-v"],
-            stdin=tty_fd,
-            stdout=tty_fd,
-            stderr=tty_fd,
-            timeout=60,
-            close_fds=False,
-            check=False,
-        )
-        os.close(tty_fd)
-        return proc.returncode
-    except OSError:
-        pass
-
-    # Strategy 3: find Hermes CLI PTY via /proc scan
-    tty_path = _find_tty_path()
-    if tty_path is not None:
-        tty_fd = None
-        try:
-            tty_fd = os.open(tty_path, os.O_RDWR)
-            proc = subprocess.run(
-                ["sudo", "-v"],
-                stdin=tty_fd,
-                stdout=tty_fd,
-                stderr=tty_fd,
-                timeout=60,
-                close_fds=False,
-                check=False,
-            )
-            os.close(tty_fd)
-            return proc.returncode
-        except OSError:
-            if tty_fd is not None:
-                try:
-                    os.close(tty_fd)
-                except OSError:
-                    pass
-
-    # Strategy 4: no-TTY fallback
-    try:
-        proc = subprocess.run(
-            ["sudo", "-v"],
-            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=None,
-            timeout=60, check=False,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
         )
-        return proc.returncode
     except Exception:
-        return 1
+        pass
+    del password
+
+    return True
 
 
 def _run_sudo_k() -> None:
+    """Invalidate sudo credentials and log the action."""
     try:
         subprocess.run(
             ["sudo", "-k"],
@@ -592,6 +736,7 @@ def _run_sudo_k() -> None:
         )
     except Exception:
         pass
+    _log_audit("KILL", "sudo -k", user="agent")
 
 
 # ---------------------------------------------------------------------------
@@ -618,12 +763,12 @@ def _handle_sudo_authorize(
             "message": f"sudo authorized for {scope}. Existing sudo credentials are valid — no password prompt needed.",
         })
 
-    logger.info("sudo_authorize: running sudo -v for scope=%s", scope)
-    rc = _run_sudo_v()
-    if rc != 0:
-        logger.warning("sudo_authorize: sudo -v failed (exit code %d)", rc)
+    logger.info("sudo_authorize: prompting for password (scope=%s)", scope)
+    ok = _run_sudo_cache()
+    if not ok:
+        logger.warning("sudo_authorize: password prompt failed or was skipped")
         return json.dumps({
-            "error": "sudo authentication failed. Check your password and try again. Make sure the hermes terminal has access to /dev/tty.",
+            "error": "sudo authentication failed. Check your password and try again.",
         })
 
     with _lock:
@@ -694,9 +839,9 @@ def _on_pre_tool_call(
 
     if scope == "session":
         if not _sudo_timestamp_valid():
-            logger.info("hermes-sudo: session timestamp expired — attempting re-auth via sudo -v")
-            rc = _run_sudo_v()
-            if rc != 0:
+            logger.info("hermes-sudo: session timestamp expired — attempting re-auth via password cache")
+            ok = _run_sudo_cache()
+            if not ok:
                 with _lock:
                     _reset_state()
                 return {
