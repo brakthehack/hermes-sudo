@@ -36,7 +36,7 @@ fi
 echo "  Copying plugin files..."
 mkdir -p "$PLUGIN_DIR"
 
-cp "$THIS_DIR"/*.py      "$PLUGIN_DIR/" 2>/dev/null || true
+cp "$THIS_DIR"/*.py      "$PLUGIN_DIR/" 2>/dev/null
 cp "$THIS_DIR"/*.yaml    "$PLUGIN_DIR/" 2>/dev/null || true
 cp "$THIS_DIR"/*.md      "$PLUGIN_DIR/" 2>/dev/null || true
 cp "$THIS_DIR"/*.toml    "$PLUGIN_DIR/" 2>/dev/null || true

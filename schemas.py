@@ -5,12 +5,12 @@ SUDO_AUTHORIZE_SCHEMA = {
     "description": (
         "Authorize the agent to run sudo commands. "
         "Opens a standard system password prompt on your terminal — "
-        "the same prompt you'd see running 'sudo' yourself.\\n\\n"
-        "Scopes:\\n"
-        "- once (default) — one sudo command, then must re-authorize\\n"
+        "the same prompt you'd see running 'sudo' yourself.\n\n"
+        "Scopes:\n"
+        "- once (default) — one sudo command, then must re-authorize\n"
         "- confirm — one sudo command; destructive operations (rm, dd, "
-        "mkfs, etc.) are blocked and require explicit re-authorization\\n"
-        "- session — authorized for all sudo commands until session ends\\n\\n"
+        "mkfs, etc.) are blocked and require explicit re-authorization\n"
+        "- session — authorized for all sudo commands until session ends\n\n"
         "Your password goes directly from your keyboard to sudo — "
         "the agent never sees, stores, or handles it."
     ),

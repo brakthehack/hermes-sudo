@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 
 def register(ctx) -> None:
+    if _schemas is None or _tools is None:
+        return
     ctx.register_tool(
         name="sudo_authorize",
         toolset="hermes_sudo",

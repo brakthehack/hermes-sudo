@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=75"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-sudo"
@@ -12,3 +12,6 @@ license = {text = "MIT"}
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 norecursedirs = [".git", "__pycache__"]
+
+[tool.setuptools.packages.find]
+where = ["."]

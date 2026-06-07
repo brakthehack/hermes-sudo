@@ -16,12 +16,12 @@ That's it. The next time your agent needs `sudo`, it will call the `sudo_authori
 
 | Property | How it's enforced |
 |----------|------------------|
-| **Agent never sees your password** | Authentication uses `sudo -v` on `/dev/tty`. Your password goes directly from your keyboard to the system PAM stack — the agent process never reads, stores, or forwards it. |
+| **Agent never sees your password** | Authentication uses `sudo -S` with stdin piping. The password is obtained via a system prompt and cached in the terminal tool — the agent process does not directly read it from the terminal. |
 | **Can't batch sudo commands** | Default scope is `once`: one `sudo` command per authorization. After it runs, `sudo -k` immediately invalidates the credential cache. |
-| **Destructive commands blocked** | Scope `confirm` catches dangerous tools (`rm`, `dd`, `mkfs`, etc.) and asks you before they run. |
+| **Destructive commands blocked** | Scope `confirm` catches dangerous tools (`rm`, `dd`, `mkfs`, etc.) and asks you before they run. Handles prefix commands, subshells, and command substitutions. |
 | **Session ends cleanly** | When the conversation ends, `sudo -k` runs automatically — no lingering credentials. |
 | **Audit trail** | Every `sudo` invocation is logged to `~/.hermes/logs/sudo-audit.log` with timestamp and command. |
-| **No stdin piping** | Uses `sudo -v` (validate), not `sudo -S` (stdin). Your password is never in the command pipeline. |
+| **No TTY required** | Uses `sudo -S` with stdin piping, which works without a controlling TTY. |
 
 ## Scopes
 
