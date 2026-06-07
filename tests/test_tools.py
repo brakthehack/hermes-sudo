@@ -1,6 +1,7 @@
 """Tests for hermes-sudo: _command_has_real_sudo and helpers."""
 import sys
 import os
+import json
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tools import _command_has_real_sudo, _command_needs_confirm
@@ -495,3 +496,218 @@ class TestLifecycleHooks:
         # Check audit log was written
         import os
         assert os.path.exists(_AUDIT_LOG)
+
+
+# ---------------------------------------------------------------------------
+# Batch authorization tests
+# ---------------------------------------------------------------------------
+
+class TestBatchAuthorization:
+    """Tests for batch scope authorization (#6)."""
+
+    def test_batch_requires_count(self):
+        from tools import _handle_sudo_authorize, _reset_state
+        import tools
+        _reset_state()
+        result = json.loads(_handle_sudo_authorize(scope="batch"))
+        assert "error" in result
+        assert "count" in result["error"]
+
+    def test_batch_count_too_high(self):
+        from tools import _handle_sudo_authorize, _reset_state
+        _reset_state()
+        # Mock _sudo_nopasswd_works to avoid password prompt
+        import tools
+        orig = tools._sudo_nopasswd_works
+        tools._sudo_nopasswd_works = lambda: False
+        try:
+            result = json.loads(_handle_sudo_authorize(scope="batch", count=101))
+            assert "error" in result
+            assert "100" in result["error"]
+        finally:
+            tools._sudo_nopasswd_works = orig
+
+    def test_batch_sets_remaining_count(self):
+        from tools import _handle_sudo_authorize, _reset_state
+        import tools
+        _reset_state()
+        orig = tools._sudo_nopasswd_works
+        tools._sudo_nopasswd_works = lambda: True
+        try:
+            result = json.loads(_handle_sudo_authorize(scope="batch", count=5))
+            assert result["success"] is True
+            assert result["scope"] == "batch"
+            assert tools._sudo_batch_remaining == 5
+        finally:
+            tools._sudo_nopasswd_works = orig
+
+    def test_batch_pre_blocks_when_exhausted(self):
+        from tools import _on_pre_tool_call, _reset_state
+        import tools
+        _reset_state()
+        tools._sudo_scope = "batch"
+        tools._sudo_batch_remaining = 0
+        result = _on_pre_tool_call(
+            tool_name="terminal",
+            args={"command": "sudo ls /tmp"},
+            session_id="test",
+        )
+        assert result["action"] == "block"
+        assert "exhausted" in result["message"]
+
+    def test_batch_pre_allows_when_remaining(self):
+        from tools import _on_pre_tool_call, _reset_state
+        import tools
+        _reset_state()
+        tools._sudo_scope = "batch"
+        tools._sudo_batch_remaining = 3
+        tools._sudo_timestamp_valid = lambda: True
+        result = _on_pre_tool_call(
+            tool_name="terminal",
+            args={"command": "sudo ls /tmp"},
+            session_id="test",
+        )
+        assert result is None  # allowed through
+
+    def test_batch_pre_blocks_destructive(self):
+        from tools import _on_pre_tool_call, _reset_state
+        import tools
+        _reset_state()
+        tools._sudo_scope = "batch"
+        tools._sudo_batch_remaining = 3
+        tools._sudo_timestamp_valid = lambda: True
+        result = _on_pre_tool_call(
+            tool_name="terminal",
+            args={"command": "sudo rm -rf /"},
+            session_id="test",
+        )
+        assert result["action"] == "block"
+        assert "destructive" in result["message"]
+
+    def test_batch_post_decrements_counter(self):
+        from tools import _on_post_tool_call, _reset_state
+        import tools
+        _reset_state()
+        tools._sudo_scope = "batch"
+        tools._sudo_batch_remaining = 3
+        _on_post_tool_call(
+            tool_name="terminal",
+            args={"command": "sudo ls /tmp"},
+            result="file1\nfile2",
+            session_id="test",
+        )
+        assert tools._sudo_batch_remaining == 2
+
+    def test_batch_post_clears_when_zero(self):
+        from tools import _on_post_tool_call, _reset_state
+        import tools
+        _reset_state()
+        tools._sudo_scope = "batch"
+        tools._sudo_batch_remaining = 1
+        _on_post_tool_call(
+            tool_name="terminal",
+            args={"command": "sudo ls /tmp"},
+            result="file1\nfile2",
+            session_id="test",
+        )
+        assert tools._sudo_batch_remaining == 0
+
+
+# ---------------------------------------------------------------------------
+# Status query tests
+# ---------------------------------------------------------------------------
+
+class TestStatusQuery:
+    """Tests for status query (#1)."""
+
+    def test_status_no_auth(self):
+        from tools import _handle_sudo_authorize, _reset_state
+        _reset_state()
+        import tools
+        orig = tools._sudo_nopasswd_works
+        tools._sudo_nopasswd_works = lambda: False
+        try:
+            result = json.loads(_handle_sudo_authorize(scope="status"))
+            assert result["scope"] == "none"
+            assert result["consumed"] is False
+            assert result["nopasswd"] is False
+        finally:
+            tools._sudo_nopasswd_works = orig
+
+    def test_status_with_session_scope(self):
+        from tools import _handle_sudo_authorize, _reset_state
+        import tools
+        _reset_state()
+        tools._sudo_scope = "session"
+        tools._sudo_consumed = False
+        orig = tools._sudo_nopasswd_works
+        tools._sudo_nopasswd_works = lambda: False
+        try:
+            result = json.loads(_handle_sudo_authorize(scope="status"))
+            assert result["scope"] == "session"
+            assert result["consumed"] is False
+        finally:
+            tools._sudo_nopasswd_works = orig
+
+    def test_status_with_batch_scope(self):
+        from tools import _handle_sudo_authorize, _reset_state
+        import tools
+        _reset_state()
+        tools._sudo_scope = "batch"
+        tools._sudo_batch_remaining = 3
+        orig = tools._sudo_nopasswd_works
+        tools._sudo_nopasswd_works = lambda: False
+        try:
+            result = json.loads(_handle_sudo_authorize(scope="status"))
+            assert result["scope"] == "batch"
+            assert result["batch_remaining"] == 3
+        finally:
+            tools._sudo_nopasswd_works = orig
+
+    def test_status_nopasswd_indicator(self):
+        from tools import _handle_sudo_authorize, _reset_state
+        import tools
+        _reset_state()
+        orig = tools._sudo_nopasswd_works
+        tools._sudo_nopasswd_works = lambda: True
+        try:
+            result = json.loads(_handle_sudo_authorize(scope="status"))
+            assert result["nopasswd"] is True
+            assert "NOPASSWD" in result.get("message", "")
+        finally:
+            tools._sudo_nopasswd_works = orig
+
+
+# ---------------------------------------------------------------------------
+# NOPASSWD feedback tests
+# ---------------------------------------------------------------------------
+
+class TestNOPASSWDFeedback:
+    """Tests for NOPASSWD feedback (#8)."""
+
+    def test_nopasswd_in_authorize_message(self):
+        from tools import _handle_sudo_authorize, _reset_state
+        import tools
+        _reset_state()
+        orig = tools._sudo_nopasswd_works
+        tools._sudo_nopasswd_works = lambda: True
+        try:
+            result = json.loads(_handle_sudo_authorize(scope="once"))
+            assert result["success"] is True
+            assert "NOPASSWD" in result["message"]
+        finally:
+            tools._sudo_nopasswd_works = orig
+
+    def test_nopasswd_in_batch_authorize_message(self):
+        from tools import _handle_sudo_authorize, _reset_state
+        import tools
+        _reset_state()
+        orig = tools._sudo_nopasswd_works
+        tools._sudo_nopasswd_works = lambda: True
+        try:
+            result = json.loads(_handle_sudo_authorize(scope="batch", count=5))
+            assert result["success"] is True
+            assert "NOPASSWD" in result["message"]
+            assert "batch" in result["message"].lower()
+        finally:
+            tools._sudo_nopasswd_works = orig

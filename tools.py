@@ -316,6 +316,7 @@ def _scan_for_confirm(command: str, n: int) -> bool:
 _lock = threading.Lock()
 _sudo_scope: Optional[str] = None   # None | "once" | "session" | "confirm"
 _sudo_consumed: bool = False
+_sudo_batch_remaining: int = 0
 
 _PREFIX_TOKENS = frozenset({
     "command", "exec", "nohup", "nice", "env", "ionice", "stdbuf",
@@ -325,9 +326,10 @@ _PREFIX_TOKENS = frozenset({
 
 def _reset_state() -> None:
     """Reset all module state. Caller must hold _lock or call from session end."""
-    global _sudo_scope, _sudo_consumed
+    global _sudo_scope, _sudo_consumed, _sudo_batch_remaining
     _sudo_scope = None
     _sudo_consumed = False
+    _sudo_batch_remaining = 0
 
 
 # ---------------------------------------------------------------------------
@@ -745,24 +747,57 @@ def _run_sudo_k() -> None:
 
 def _handle_sudo_authorize(
     scope: str = "once",
+    count: int = 0,
     **kwargs: Any,
 ) -> str:
-    global _sudo_scope, _sudo_consumed
+    global _sudo_scope, _sudo_consumed, _sudo_batch_remaining
     scope = scope.strip().lower() if isinstance(scope, str) else "once"
-    if scope not in ("once", "confirm", "session"):
-        return json.dumps({"error": f"Invalid scope '{scope}'. Must be 'once', 'confirm', or 'session'."})
 
+    # --- Status query ---
+    if scope == "status":
+        with _lock:
+            cur_scope = _sudo_scope
+            cur_consumed = _sudo_consumed
+            cur_batch = _sudo_batch_remaining
+        nopasswd = _sudo_nopasswd_works()
+        result: Dict[str, Any] = {
+            "scope": cur_scope or "none",
+            "consumed": cur_consumed,
+            "nopasswd": nopasswd,
+        }
+        if cur_scope == "batch":
+            result["batch_remaining"] = cur_batch
+        if nopasswd and cur_scope is None:
+            result["message"] = "sudo NOPASSWD is configured — no password prompt needed."
+        elif cur_scope is None:
+            result["message"] = "No active sudo authorization. Call sudo_authorize to authorize."
+        return json.dumps(result)
+
+    # --- Validate scope ---
+    if scope not in ("once", "confirm", "session", "batch"):
+        return json.dumps({"error": f"Invalid scope '{scope}'. Must be 'once', 'confirm', 'session', or 'batch'."})
+
+    if scope == "batch":
+        if not isinstance(count, int) or count < 1:
+            return json.dumps({"error": "Batch scope requires a positive integer 'count' parameter."})
+        if count > 100:
+            return json.dumps({"error": "Batch count limited to 100. Use 'session' for unlimited."})
+
+    # --- NOPASSWD fast path ---
     if _sudo_nopasswd_works():
         with _lock:
             _sudo_scope = scope
             _sudo_consumed = False
-        logger.info("sudo_authorize: already have sudo access (NOPASSWD or existing timestamp) — scope=%s", scope)
+            _sudo_batch_remaining = count if scope == "batch" else 0
+        logger.info("sudo_authorize: NOPASSWD sudo detected — scope=%s", scope)
+        msg = _scope_message(scope, count)
         return json.dumps({
             "success": True,
             "scope": scope,
-            "message": f"sudo authorized for {scope}. Existing sudo credentials are valid — no password prompt needed.",
+            "message": msg + " sudo NOPASSWD is configured — no password prompt needed.",
         })
 
+    # --- Password prompt ---
     logger.info("sudo_authorize: prompting for password (scope=%s)", scope)
     ok = _run_sudo_cache()
     if not ok:
@@ -774,19 +809,31 @@ def _handle_sudo_authorize(
     with _lock:
         _sudo_scope = scope
         _sudo_consumed = False
+        _sudo_batch_remaining = count if scope == "batch" else 0
 
-    _log_audit("AUTHORIZE", f"scope={scope}", user="human")
+    _log_audit("AUTHORIZE", f"scope={scope}" + (f" count={count}" if scope == "batch" else ""), user="human")
     logger.info("sudo_authorize: authorized for scope=%s", scope)
     return json.dumps({
         "success": True,
         "scope": scope,
-        "message": f"sudo authorized for {scope}. "
+        "message": _scope_message(scope, count),
+    })
+
+
+def _scope_message(scope: str, count: int = 0) -> str:
+    if scope == "batch":
+        return (
+            f"sudo authorized for {count} commands (batch). "
+            f"Destructive commands (rm, dd, mkfs, etc.) will be blocked and need explicit approval."
+        )
+    return (
+        f"sudo authorized for {scope}. "
         + {
             "once": "The agent may run one sudo command, then must re-authorize.",
             "confirm": "The agent may run one sudo command. Destructive commands (rm, dd, mkfs, etc.) will be blocked and need explicit approval.",
             "session": "The agent may run sudo commands for the remainder of this session.",
-        }[scope],
-    })
+        }[scope]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -852,6 +899,34 @@ def _on_pre_tool_call(
         _log_audit("EXEC", command, user="agent-session")
         return None
 
+    if scope == "batch":
+        if _sudo_batch_remaining <= 0:
+            return {
+                "action": "block",
+                "message": "sudo batch authorization has been exhausted. Call sudo_authorize(scope='batch' count=N) to authorize more commands.",
+            }
+
+        if not _sudo_timestamp_valid():
+            with _lock:
+                _reset_state()
+            return {
+                "action": "block",
+                "message": "sudo timestamp expired. Call sudo_authorize(scope='batch' count=N) to re-authorize.",
+            }
+
+        if _command_needs_confirm(command):
+            return {
+                "action": "block",
+                "message": (
+                    "This sudo command uses a potentially destructive tool.\n\n"
+                    f"{command}\n\n"
+                    "Call sudo_authorize(scope='once') to authorize it without further confirmation."
+                ),
+            }
+
+        _log_audit("EXEC", command, user=f"agent-batch-remaining={_sudo_batch_remaining}")
+        return None
+
     if scope in ("once", "confirm"):
         if consumed:
             return {
@@ -896,7 +971,7 @@ def _on_post_tool_call(
     tool_call_id: str = "",
     **kwargs: Any,
 ) -> None:
-    global _sudo_consumed
+    global _sudo_consumed, _sudo_batch_remaining
 
     if tool_name != "terminal":
         return
@@ -916,6 +991,14 @@ def _on_post_tool_call(
             _sudo_consumed = True
         logger.debug("hermes-sudo: %s-scoped authorization consumed — clearing timestamp", scope)
         _run_sudo_k()
+
+    if scope == "batch":
+        with _lock:
+            _sudo_batch_remaining -= 1
+            remaining = _sudo_batch_remaining
+        logger.debug("hermes-sudo: batch authorization decremented — %d remaining", remaining)
+        if remaining <= 0:
+            _run_sudo_k()
 
 
 # ---------------------------------------------------------------------------
