@@ -1,0 +1,169 @@
+diff --git a/cli.py b/cli.py
+index 000778b75..f580fd99b 100644
+--- a/cli.py
++++ b/cli.py
+@@ -11857,8 +11857,23 @@ class HermesCLI:
+         response_queue = queue.Queue()
+ 
+         self._capture_modal_input_snapshot()
++        # Clear any leftover text in the buffer so the user doesn't see
++        # masked characters before typing their password.
++        try:
++            buf = self._app.current_buffer
++            buf.text = ''
++            buf.cursor_position = 0
++            buf.reset()
++        except Exception:
++            pass
++        try:
++            from tools.terminal_tool import get_sudo_pending_command
++            _pending = get_sudo_pending_command()
++        except Exception:
++            _pending = None
+         self._sudo_state = {
+             "response_queue": response_queue,
++            "pending_command": _pending,
+         }
+         self._sudo_deadline = _time.monotonic() + timeout
+ 
+@@ -14740,14 +14755,25 @@ class HermesCLI:
+             if not state:
+                 return []
+             title = '🔐 Sudo Password Required'
+-            body = 'Enter password below (hidden), or press Enter to skip'
+-            box_width = _panel_box_width(title, [body])
++            pending = state.get("pending_command")
++            body_parts: list[tuple[str, str]] = []  # (style, text)
++            if pending:
++                cmd_lines = re.findall(r'.{1,60}', pending.replace('\n', ' '))
++                for c in cmd_lines:
++                    body_parts.append(('class:sudo-command', f'Command: {c}'))
++                body_parts.append(('class:sudo-border', ''))
++            body_parts.append(('class:sudo-text', 'Enter password below (hidden), or press Enter to skip'))
++            box_width = _panel_box_width(title, [t for _, t in body_parts])
+             lines = []
+             lines.append(('class:sudo-border', '╭─ '))
+             lines.append(('class:sudo-title', title))
+-            lines.append(('class:sudo-border', ' ' + ('─' * max(0, box_width - len(title) - 3)) + '╮\n'))
++            lines.append(('class:sudo-border', ' ' + ('─' * max(0, box_width - len(title) - 4)) + '╮\n'))
+             _append_blank_panel_line(lines, 'class:sudo-border', box_width)
+-            _append_panel_line(lines, 'class:sudo-border', 'class:sudo-text', body, box_width)
++            for style, bp in body_parts:
++                if bp:
++                    _append_panel_line(lines, 'class:sudo-border', style, bp, box_width)
++                else:
++                    _append_blank_panel_line(lines, 'class:sudo-border', box_width)
+             _append_blank_panel_line(lines, 'class:sudo-border', box_width)
+             lines.append(('class:sudo-border', '╰' + ('─' * box_width) + '╯\n'))
+             return lines
+@@ -15025,6 +15051,7 @@ class HermesCLI:
+             'sudo-prompt': '#FF6B6B bold',
+             'sudo-border': '#CD7F32',
+             'sudo-title': '#FF6B6B bold',
++            'sudo-command': '#FF6B6B bold',
+             'sudo-text': '#FFF8DC',
+             # Dangerous command approval panel
+             'approval-border': '#CD7F32',
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index 3e81eff9f..59a74bcd6 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -171,6 +171,12 @@ _sudo_password_cache_lock = threading.Lock()
+ # the per-session queue in tools.approval, not through these callbacks,
+ # so it's unaffected.
+ _callback_tls = threading.local()
++def set_sudo_pending_command(cmd: str | None) -> None:
++    """Set the pending sudo command for the current thread."""
++    _callback_tls.sudo_pending_command = cmd
++def get_sudo_pending_command() -> str | None:
++    """Return the pending sudo command for the current thread."""
++    return getattr(_callback_tls, "sudo_pending_command", None)
+ 
+ 
+ def _get_sudo_password_callback():
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 0e5590542..e0dc84d4f 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -2231,7 +2231,18 @@ def _wire_callbacks(sid: str):
+     from tools.terminal_tool import set_sudo_password_callback
+     from tools.skills_tool import set_secret_capture_callback
+ 
+-    set_sudo_password_callback(lambda: _block("sudo.request", sid, {}, timeout=120))
++    def _sudo_cb():
++        try:
++            from tools.terminal_tool import get_sudo_pending_command
++            _pc = get_sudo_pending_command()
++        except Exception:
++            _pc = None
++        pl = {}
++        if _pc:
++            pl["pending_command"] = _pc
++        return _block("sudo.request", sid, pl, timeout=120)
++
++    set_sudo_password_callback(_sudo_cb)
+ 
+     def secret_cb(env_var, prompt, metadata=None):
+         pl = {"prompt": prompt, "env_var": env_var}
+diff --git a/ui-tui/src/components/appOverlays.tsx b/ui-tui/src/components/appOverlays.tsx
+index fd7f8aaa8..e4448d22a 100644
+--- a/ui-tui/src/components/appOverlays.tsx
++++ b/ui-tui/src/components/appOverlays.tsx
+@@ -68,7 +68,14 @@ export function PromptZone({
+   if (overlay.sudo) {
+     return (
+       <Box flexDirection="column" flexShrink={0} paddingX={1} paddingY={1}>
+-        <MaskedPrompt cols={cols} icon="🔐" label="sudo password required" onSubmit={onSudoSubmit} t={theme} />
++        <MaskedPrompt
++          cols={cols}
++          icon="🔐"
++          label="sudo password required"
++          onSubmit={onSudoSubmit}
++          sub={overlay.sudo.pendingCommand}
++          t={theme}
++        />
+       </Box>
+     )
+   }
+diff --git a/ui-tui/src/components/maskedPrompt.tsx b/ui-tui/src/components/maskedPrompt.tsx
+index 27a9021f6..752935cb8 100644
+--- a/ui-tui/src/components/maskedPrompt.tsx
++++ b/ui-tui/src/components/maskedPrompt.tsx
+@@ -14,7 +14,11 @@ export function MaskedPrompt({ cols = 80, icon, label, onSubmit, sub, t }: Maske
+         {icon} {label}
+       </Text>
+ 
+-      {sub && <Text color={t.color.muted}> {sub}</Text>}
++      {sub && (
++        <Box marginTop={1}>
++          <Text bold color={t.color.accent}>Command: {sub}</Text>
++        </Box>
++      )}
+ 
+       <Box>
+         <Text color={t.color.label}>{'> '}</Text>
+diff --git a/ui-tui/src/gatewayTypes.ts b/ui-tui/src/gatewayTypes.ts
+index 0f1e89841..d1b9a1dbd 100644
+--- a/ui-tui/src/gatewayTypes.ts
++++ b/ui-tui/src/gatewayTypes.ts
+@@ -568,7 +568,7 @@ export type GatewayEvent =
+       type: 'clarify.request'
+     }
+   | { payload: { command: string; description: string }; session_id?: string; type: 'approval.request' }
+-  | { payload: { request_id: string }; session_id?: string; type: 'sudo.request' }
++  | { payload: { request_id: string; pending_command?: string }; session_id?: string; type: 'sudo.request' }
+   | { payload: { env_var: string; prompt: string; request_id: string }; session_id?: string; type: 'secret.request' }
+   | { payload: { task_id: string; text: string }; session_id?: string; type: 'background.complete' }
+   | { payload?: { text?: string }; session_id?: string; type: 'review.summary' }
+diff --git a/ui-tui/src/types.ts b/ui-tui/src/types.ts
+index 60f0db48e..93e6c0d7b 100644
+--- a/ui-tui/src/types.ts
++++ b/ui-tui/src/types.ts
+@@ -179,6 +179,7 @@ export interface Usage {
+ 
+ export interface SudoReq {
+   requestId: string
++  pendingCommand?: string
+ }
+ 
+ export interface SecretReq {
