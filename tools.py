@@ -317,6 +317,7 @@ _lock = threading.Lock()
 _sudo_scope: Optional[str] = None   # None | "once" | "session" | "confirm"
 _sudo_consumed: bool = False
 _sudo_batch_remaining: int = 0
+_pending_command: Optional[str] = None
 
 _PREFIX_TOKENS = frozenset({
     "command", "exec", "nohup", "nice", "env", "ionice", "stdbuf",
@@ -326,10 +327,11 @@ _PREFIX_TOKENS = frozenset({
 
 def _reset_state() -> None:
     """Reset all module state. Caller must hold _lock or call from session end."""
-    global _sudo_scope, _sudo_consumed, _sudo_batch_remaining
+    global _sudo_scope, _sudo_consumed, _sudo_batch_remaining, _pending_command
     _sudo_scope = None
     _sudo_consumed = False
     _sudo_batch_remaining = 0
+    _pending_command = None
 
 
 # ---------------------------------------------------------------------------
@@ -683,7 +685,7 @@ def _find_tty_path() -> Optional[str]:
     return None
 
 
-def _run_sudo_cache() -> bool:
+def _run_sudo_cache(pending_command: Optional[str] = None) -> bool:
     """Prompt for sudo password and store it in the terminal tool's password cache.
 
     The terminal tool already handles piping the password via ``sudo -S`` on every
@@ -692,20 +694,36 @@ def _run_sudo_cache() -> bool:
 
     This avoids all TTY / ``requiretty`` issues: the password is piped on stdin
     by the terminal tool's environment runner, which works without any TTY.
+
+    If *pending_command* is provided, it is shown to the user in the prompt
+    so they can see exactly what command they are authorizing.
     """
+    _prompt_fn = None
+    _cache_fn = None
+    _set_pending_fn = None
     try:
         from tools.terminal_tool import (
-            _prompt_for_sudo_password,
-            _set_cached_sudo_password,
+            _prompt_for_sudo_password as _prompt_fn,
+            _set_cached_sudo_password as _cache_fn,
         )
+        try:
+            from tools.terminal_tool import set_sudo_pending_command as _set_pending_fn
+        except Exception:
+            pass
     except ImportError:
         return False
 
-    password = _prompt_for_sudo_password(timeout_seconds=45)
+    try:
+        if pending_command and _set_pending_fn is not None:
+            _set_pending_fn(pending_command)
+        password = _prompt_fn(timeout_seconds=45)
+    finally:
+        if _set_pending_fn is not None:
+            _set_pending_fn(None)
     if not password:
         return False
 
-    _set_cached_sudo_password(password)
+    _cache_fn(password)
     # Kick sudo -v in the background so the kernel timestamp is also valid.
     # This is best-effort — the password-pipe path in the terminal tool works
     # even if sudo -v fails.
@@ -725,6 +743,43 @@ def _run_sudo_cache() -> bool:
 
     return True
 
+def _run_sudo_command(command: str, password: str) -> Dict[str, Any]:
+    """Run a sudo command directly, piping the password via sudo -S.
+
+    Returns a dict with 'success', 'output', 'exit_code' keys.
+    """
+    full_command = f"sudo -S {command}"
+    logger.info("hermes-sudo: running command: %s", full_command)
+    _log_audit("EXEC", command, user="agent")
+    try:
+        result = subprocess.run(
+            full_command,
+            shell=True,
+            input=password + "\n",
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        output = result.stdout + result.stderr
+        return {
+            "success": result.returncode == 0,
+            "command": f"sudo {command}",
+            "exit_code": result.returncode,
+            "output": output[-4096:] if output else "",
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "success": False,
+            "command": f"sudo {command}",
+            "error": "Command timed out after 120 seconds.",
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "command": f"sudo {command}",
+            "error": str(e),
+        }
+
 
 def _run_sudo_k() -> None:
     """Invalidate sudo credentials and log the action."""
@@ -741,17 +796,17 @@ def _run_sudo_k() -> None:
     _log_audit("KILL", "sudo -k", user="agent")
 
 
-# ---------------------------------------------------------------------------
-# Tool handler: sudo_authorize
-# ---------------------------------------------------------------------------
-
 def _handle_sudo_authorize(
     scope: str = "once",
     count: int = 0,
+    command: Optional[str] = None,
+    pending_command: Optional[str] = None,
     **kwargs: Any,
 ) -> str:
-    global _sudo_scope, _sudo_consumed, _sudo_batch_remaining
+    global _sudo_scope, _sudo_consumed, _sudo_batch_remaining, _pending_command
     scope = scope.strip().lower() if isinstance(scope, str) else "once"
+    # Normalize: if command is provided, use it as pending_command for display.
+    display_command = command if command else pending_command
 
     # --- Status query ---
     if scope == "status":
@@ -759,6 +814,7 @@ def _handle_sudo_authorize(
             cur_scope = _sudo_scope
             cur_consumed = _sudo_consumed
             cur_batch = _sudo_batch_remaining
+            cur_pending = _pending_command
         nopasswd = _sudo_nopasswd_works()
         result: Dict[str, Any] = {
             "scope": cur_scope or "none",
@@ -767,6 +823,8 @@ def _handle_sudo_authorize(
         }
         if cur_scope == "batch":
             result["batch_remaining"] = cur_batch
+        if cur_pending:
+            result["pending_command"] = cur_pending
         if nopasswd and cur_scope is None:
             result["message"] = "sudo NOPASSWD is configured — no password prompt needed."
         elif cur_scope is None:
@@ -789,35 +847,73 @@ def _handle_sudo_authorize(
             _sudo_scope = scope
             _sudo_consumed = False
             _sudo_batch_remaining = count if scope == "batch" else 0
+            _pending_command = display_command if display_command else None
+
+        try:
+            subprocess.run(
+                ["sudo", "-n", "-v"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+        except Exception:
+            pass
+
+        # If command was provided, run it directly.
+        if command:
+            r = _run_sudo_command(command, "")
+            return json.dumps(r)
+
         logger.info("sudo_authorize: NOPASSWD sudo detected — scope=%s", scope)
         msg = _scope_message(scope, count)
-        return json.dumps({
+        result: Dict[str, Any] = {
             "success": True,
             "scope": scope,
             "message": msg + " sudo NOPASSWD is configured — no password prompt needed.",
-        })
+        }
+        if display_command:
+            result["pending_command"] = display_command
+        return json.dumps(result)
 
     # --- Password prompt ---
     logger.info("sudo_authorize: prompting for password (scope=%s)", scope)
-    ok = _run_sudo_cache()
+    ok = _run_sudo_cache(pending_command=display_command)
     if not ok:
         logger.warning("sudo_authorize: password prompt failed or was skipped")
         return json.dumps({
             "error": "sudo authentication failed. Check your password and try again.",
         })
 
+    # If command was provided, run it directly with the password.
+    if command:
+        from tools.terminal_tool import _get_cached_sudo_password
+        password = _get_cached_sudo_password()
+        if not password:
+            return json.dumps({
+                "error": "Password not available. Call sudo_authorize again.",
+            })
+        r = _run_sudo_command(command, password)
+        del password
+        return json.dumps(r)
+
     with _lock:
         _sudo_scope = scope
         _sudo_consumed = False
         _sudo_batch_remaining = count if scope == "batch" else 0
+        _pending_command = display_command if display_command else None
 
     _log_audit("AUTHORIZE", f"scope={scope}" + (f" count={count}" if scope == "batch" else ""), user="human")
     logger.info("sudo_authorize: authorized for scope=%s", scope)
-    return json.dumps({
+    result: Dict[str, Any] = {
         "success": True,
         "scope": scope,
         "message": _scope_message(scope, count),
-    })
+    }
+    if display_command:
+        result["pending_command"] = display_command
+    return json.dumps(result)
 
 
 def _scope_message(scope: str, count: int = 0) -> str:
@@ -971,7 +1067,7 @@ def _on_post_tool_call(
     tool_call_id: str = "",
     **kwargs: Any,
 ) -> None:
-    global _sudo_consumed, _sudo_batch_remaining
+    global _sudo_consumed, _sudo_batch_remaining, _pending_command
 
     if tool_name != "terminal":
         return
@@ -989,16 +1085,22 @@ def _on_post_tool_call(
     if scope in ("once", "confirm"):
         with _lock:
             _sudo_consumed = True
+            _pending_command = None
         logger.debug("hermes-sudo: %s-scoped authorization consumed — clearing timestamp", scope)
         _run_sudo_k()
 
     if scope == "batch":
         with _lock:
             _sudo_batch_remaining -= 1
+            _pending_command = None
             remaining = _sudo_batch_remaining
         logger.debug("hermes-sudo: batch authorization decremented — %d remaining", remaining)
         if remaining <= 0:
             _run_sudo_k()
+
+    if scope == "session":
+        with _lock:
+            _pending_command = None
 
 
 # ---------------------------------------------------------------------------
