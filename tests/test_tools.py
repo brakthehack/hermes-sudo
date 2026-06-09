@@ -711,3 +711,136 @@ class TestNOPASSWDFeedback:
             assert "batch" in result["message"].lower()
         finally:
             tools._sudo_nopasswd_works = orig
+# ---------------------------------------------------------------------------
+# Pending command visibility tests
+# ---------------------------------------------------------------------------
+class TestPendingCommand:
+    """Tests for pending_command visibility during authorization."""
+    def test_pending_command_in_nopasswd_response(self):
+        from tools import _handle_sudo_authorize, _reset_state
+        import tools
+        _reset_state()
+        orig = tools._sudo_nopasswd_works
+        tools._sudo_nopasswd_works = lambda: True
+        try:
+            result = json.loads(_handle_sudo_authorize(
+                scope="once",
+                pending_command="sudo apt update",
+            ))
+            assert result["success"] is True
+            assert result.get("pending_command") == "sudo apt update"
+            # State also updated
+            assert tools._pending_command == "sudo apt update"
+        finally:
+            tools._sudo_nopasswd_works = orig
+    def test_pending_command_not_in_response_when_not_provided(self):
+        from tools import _handle_sudo_authorize, _reset_state
+        import tools
+        _reset_state()
+        orig = tools._sudo_nopasswd_works
+        tools._sudo_nopasswd_works = lambda: True
+        try:
+            result = json.loads(_handle_sudo_authorize(scope="once"))
+            assert result["success"] is True
+            assert "pending_command" not in result
+            assert tools._pending_command is None
+        finally:
+            tools._sudo_nopasswd_works = orig
+    def test_pending_command_in_status(self):
+        from tools import _handle_sudo_authorize, _reset_state
+        import tools
+        _reset_state()
+        orig = tools._sudo_nopasswd_works
+        tools._sudo_nopasswd_works = lambda: True
+        try:
+            _handle_sudo_authorize(
+                scope="once",
+                pending_command="sudo ls /root",
+            )
+            result = json.loads(_handle_sudo_authorize(scope="status"))
+            assert result.get("pending_command") == "sudo ls /root"
+        finally:
+            tools._sudo_nopasswd_works = orig
+    def test_pending_command_not_in_status_when_none(self):
+        from tools import _handle_sudo_authorize, _reset_state
+        import tools
+        _reset_state()
+        orig = tools._sudo_nopasswd_works
+        tools._sudo_nopasswd_works = lambda: True
+        try:
+            _handle_sudo_authorize(scope="once")
+            result = json.loads(_handle_sudo_authorize(scope="status"))
+            assert "pending_command" not in result
+        finally:
+            tools._sudo_nopasswd_works = orig
+    def test_pending_command_cleared_on_reset(self):
+        from tools import _reset_state
+        import tools
+        tools._pending_command = "sudo rm -rf /"
+        _reset_state()
+        assert tools._pending_command is None
+    def test_command_param_in_nopasswd_response(self):
+        """When command is provided with NOPASSWD, it runs directly."""
+        from tools import _handle_sudo_authorize, _reset_state, _run_sudo_command
+        import tools
+        _reset_state()
+        orig_works = tools._sudo_nopasswd_works
+        orig_run = tools._run_sudo_command
+        tools._sudo_nopasswd_works = lambda: True
+        tools._run_sudo_command = lambda cmd, pw: {
+            "success": True,
+            "command": f"sudo {cmd}",
+            "exit_code": 0,
+            "output": "ok",
+        }
+        try:
+            result = json.loads(_handle_sudo_authorize(command="apt update"))
+            assert result["success"] is True
+            assert result["command"] == "sudo apt update"
+            assert result["exit_code"] == 0
+        finally:
+            tools._sudo_nopasswd_works = orig_works
+            tools._run_sudo_command = orig_run
+    def test_command_strips_sudo_prefix(self):
+        """Command param should not include 'sudo' prefix — plugin adds it."""
+        from tools import _handle_sudo_authorize, _reset_state, _run_sudo_command
+        import tools
+        _reset_state()
+        orig_works = tools._sudo_nopasswd_works
+        orig_run = tools._run_sudo_command
+        tools._sudo_nopasswd_works = lambda: True
+        tools._run_sudo_command = lambda cmd, pw: {
+            "success": True,
+            "command": f"sudo {cmd}",
+            "exit_code": 0,
+            "output": "ok",
+        }
+        try:
+            # Agent passes command without sudo prefix
+            result = json.loads(_handle_sudo_authorize(command="systemctl restart nginx"))
+            assert result["command"] == "sudo systemctl restart nginx"
+        finally:
+            tools._sudo_nopasswd_works = orig_works
+            tools._run_sudo_command = orig_run
+    def test_command_failure_returns_error(self):
+        """Failed command returns error details."""
+        from tools import _handle_sudo_authorize, _reset_state, _run_sudo_command
+        import tools
+        _reset_state()
+        orig_works = tools._sudo_nopasswd_works
+        orig_run = tools._run_sudo_command
+        tools._sudo_nopasswd_works = lambda: True
+        tools._run_sudo_command = lambda cmd, pw: {
+            "success": False,
+            "command": f"sudo {cmd}",
+            "exit_code": 1,
+            "output": "Error: unit nginx.service not found",
+        }
+        try:
+            result = json.loads(_handle_sudo_authorize(command="systemctl restart nginx"))
+            assert result["success"] is False
+            assert result["exit_code"] == 1
+            assert "not found" in result["output"]
+        finally:
+            tools._sudo_nopasswd_works = orig_works
+            tools._run_sudo_command = orig_run
